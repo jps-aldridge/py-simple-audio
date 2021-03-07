@@ -46,11 +46,16 @@ MMRESULT fill_buffer(WAVEHDR* wave_header, audio_blob_t* audio_blob) {
         result = waveOutUnprepareHeader(audio_blob->handle, wave_header, sizeof(WAVEHDR));
         if (result != MMSYSERR_NOERROR) {return result;}
         memcpy(wave_header->lpData, &((char*)audio_blob->buffer_obj.buf)[audio_blob->used_bytes], have);
+
+        /* Setting the buffer length should be done before the call to waveOutWrite */
+        /* otherwise extra junk data might be sent in the last buffer if the sound  */
+        /* was not a round number of buffers in length.                             */
+        wave_header->dwBufferLength = have;
+
         result = waveOutPrepareHeader(audio_blob->handle, wave_header, sizeof(WAVEHDR));
         if (result != MMSYSERR_NOERROR) {return result;}
         result = waveOutWrite(audio_blob->handle, wave_header, sizeof(WAVEHDR));
         if (result != MMSYSERR_NOERROR) {return result;}
-        wave_header->dwBufferLength = have;
         audio_blob->used_bytes += have;
     /* ... no more audio left to buffer */
     } else {
@@ -123,7 +128,12 @@ PyObject* play_os(Py_buffer buffer_obj, int len_samples, int num_channels, int b
 
     DBG_PLAY_OS_CALL
 
-    buffer_size = get_buffer_size(latency_us / NUM_BUFS, sample_rate, bytes_per_chan * num_channels);
+    /* Dividing by NUM_BUFS, as this code used to, results in buffers of only 0.05 	*/
+    /* seconds, which seems to be too short for smooth playback, at least on my     */
+    /* Windows 10 machine, and and that of a friend. This change results in each    */
+    /* buffer being SA_LATENCY_US in length, which is arguably right since playback */
+    /* will start once the first buffer is full.                                    */
+    buffer_size = get_buffer_size(latency_us, sample_rate, bytes_per_chan * num_channels);
 
     audio_blob = create_audio_blob();
     audio_blob->buffer_obj = buffer_obj;
@@ -187,17 +197,14 @@ PyObject* play_os(Py_buffer buffer_obj, int len_samples, int num_channels, int b
         temp_wave_hdr->lpData = PyMem_Malloc(buffer_size);
         temp_wave_hdr->dwBufferLength = buffer_size;
 
-        result = fill_buffer(temp_wave_hdr, audio_blob);
-        if (result != MMSYSERR_NOERROR) {
-            waveOutGetErrorText(result, sys_msg_buf, SYS_STR_LEN);
-            WIN_EXCEPTION("Failed to buffer audio.", result, sys_msg_buf, err_msg_buf);
-
-            PostThreadMessage(thread_id, WM_QUIT, 0, 0);
-            waveOutUnprepareHeader(audio_blob->handle, temp_wave_hdr, sizeof(WAVEHDR));
-            waveOutClose(audio_blob->handle);
-            destroy_audio_blob(audio_blob);
-            return NULL;
-        }
+        /* There was a possible timing problem with the old code here, which used   */
+        /* to call fill_buffer() directly. If Windows finishes playing the first    */
+        /* buffer, thus triggering the refill code in bufferThread(), while this    */
+        /* this code is still creating and filling the second, then we could have   */
+        /* two threads draining data from the audio blob at the at the same time.   */
+        /* It seems safer to use PostThreadMessage to get bufferThread() to perform */
+        /* the initial fill too.                                                    */
+        PostThreadMessage(thread_id, MM_WOM_DONE, (WPARAM)(audio_blob->handle), (LPARAM)temp_wave_hdr);
     }
 
     return PyLong_FromUnsignedLongLong(audio_blob->play_list_item->play_id);
